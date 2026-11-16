@@ -110,8 +110,8 @@ def remove_compiled_packages():
 def check_imports():
     """Проверяет, что приложение и библиотеки загружаются; если нет - показывает ошибку."""
     checks = (("openpyxl", "import openpyxl"), ("tkinter", "import tkinter"),
-              ("модуль сверки", "import sys, pandas_lite; sys.modules['pandas'] = pandas_lite; "
-                                "import compare_excel"))
+              ("программа", "import sys, sverka_gui; "
+                            "sys.exit(str(sverka_gui.IMPORT_ERROR) if sverka_gui.IMPORT_ERROR else 0)"))
     failed = []
     for module, code in checks:
         done = subprocess.run([str(venv_python()), "-c", code], cwd=str(APP_DIR),

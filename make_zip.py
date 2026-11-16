@@ -12,7 +12,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 FOLDER = "SverkaExcel"                      # папка внутри архива
 TARGET = ROOT / "dist" / "SverkaExcel-setup.zip"
-FILES = ["compare_excel.py", "pandas_lite.py", "sverka_gui.py", "install.py", "requirements.txt",
+FILES = ["compare_excel.py", "pandas_lite.py", "engine.py", "storage.py", "service.py",
+         "sverka_gui.py", "gui_widgets.py", "gui_result.py", "gui_history.py", "gui_dicts.py",
+         "install.py", "requirements.txt",
          "install.bat", "run.bat", "install.command", "install.sh", "run.sh"]
 EXECUTABLE = (".py", ".sh", ".command")
 

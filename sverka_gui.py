@@ -2,28 +2,25 @@
 """
 Графическое приложение для сверки двух Excel-файлов.
 
-Это только окно: выбор файлов, запуск сверки и сохранение отчёта. Сама сверка
-и построение отчёта целиком выполняются модулем compare_excel.py - приложение
-вызывает ту же функцию run_pair, что и запуск из командной строки, с теми же
-значениями параметров по умолчанию.
+Вкладки окна:
+    Новая сверка             выбор системы, отчёта, периода и двух файлов
+    Результат                итог, разбивка по месяцам, расхождения, Excel-отчёт
+    История                  все прошлые сверки с отбором
+    Справочники              системы и их отчёты
+    Дополнительные параметры те же настройки, что у compare_excel.py в командной строке
 
-Библиотеку pandas, которую использует compare_excel.py, в приложении заменяет
-модуль pandas_lite (чистый Python): скомпилированные файлы pandas и numpy
-Windows может заблокировать. Сам compare_excel.py при этом не меняется.
+Сама сверка и построение отчёта целиком выполняются модулем compare_excel.py.
+Библиотеку pandas, которую он использует, в приложении заменяет pandas_lite
+(чистый Python): скомпилированные файлы pandas и numpy Windows может
+заблокировать. Сам compare_excel.py при этом не меняется.
 
 Запуск:
     python sverka_gui.py
 """
 
-import atexit
-import contextlib
-import io
-import os
+import json
 import queue
-import shutil
-import subprocess
 import sys
-import tempfile
 import threading
 import traceback
 from pathlib import Path
@@ -31,11 +28,21 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    import service
+    from engine import ce
+    from gui_dicts import DictView
+    from gui_history import HistoryView
+    from gui_result import ResultView
+    from gui_widgets import BG, CARD, MUTED, fix_tree_colors, install_wheel, make_fonts
+    from storage import Store
+    IMPORT_ERROR = None
+except ImportError as error:        # не установлены библиотеки: сообщим об этом в окне
+    IMPORT_ERROR = error
+
 APP_TITLE = "Сверка Excel-файлов"
 EXCEL_TYPES = [("Файлы Excel", "*.xlsx *.xlsm"), ("Все файлы", "*.*")]
-GREEN, GREEN_TEXT = "#C6EFCE", "#006100"
-RED, RED_TEXT = "#FFC7CE", "#9C0006"
-GREY_TEXT = "#595959"
+NO_SYSTEM = "— без справочника —"
 
 
 def split_list(text):
@@ -50,116 +57,122 @@ def parse_float(text, title):
         raise ValueError(f"{title}: нужно число, а указано «{text.strip()}»") from None
 
 
-def open_file(path):
-    """Открывает файл программой по умолчанию (Excel)."""
-    if sys.platform == "win32":
-        os.startfile(path)   # noqa: S606 - открываем отчёт, который сами создали
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", str(path)])
-    else:
-        subprocess.Popen(["xdg-open", str(path)])
-
-
 class App(tk.Tk):
-    def __init__(self, engine):
+    def __init__(self, store=None):
         super().__init__()
-        self.engine = engine
         self.title(APP_TITLE)
-        self.geometry("900x640")
-        self.minsize(760, 520)
-
-        # Отчёты складываются во временную папку; пользователь сохраняет копию
-        self.tmp = Path(tempfile.mkdtemp(prefix="sverka_"))
-        atexit.register(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.geometry("980x700")
+        self.minsize(900, 600)
+        self.store = store or Store()
+        self.fonts = make_fonts(self)
         self.events = queue.Queue()
-        self.report = None       # готовый отчёт во временной папке
-        self.saved = None        # куда пользователь его сохранил
         self.last_dir = str(Path.home())
+        self.system_ids, self.report_ids = {}, {}
 
         style = ttk.Style(self)
         if self.tk.call("tk", "windowingsystem") == "x11" and "clam" in style.theme_names():
             style.theme_use("clam")
-        style.configure("Run.TButton", font=("TkDefaultFont", 11, "bold"), padding=(18, 7))
-        style.configure("Hint.TLabel", foreground=GREY_TEXT)
+        fix_tree_colors(style)
+        self.configure(bg=BG)
+        for name in ("TFrame", "TLabel", "TCheckbutton", "TRadiobutton", "TLabelframe",
+                     "TLabelframe.Label"):
+            style.configure(name, background=BG)
+        style.configure("Run.TButton", font=self.fonts["head"], padding=(18, 7))
+        style.configure("Hint.TLabel", foreground=MUTED)
+        style.configure("Link.TButton", relief="flat", padding=(2, 1), foreground="#1F5FA8",
+                        background=CARD)
+        style.configure("Treeview", rowheight=24)
+        install_wheel(self)
 
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(100, self._poll)
 
     # ---------- окно ----------
 
     def _build(self):
-        # Две вкладки: сама сверка и необязательные параметры
         self.tabs = ttk.Notebook(self)
         self.tabs.pack(fill="both", expand=True, padx=8, pady=8)
-        main = ttk.Frame(self.tabs, padding=14)
-        main.columnconfigure(1, weight=1)
-        self.tabs.add(main, text="  Сверка  ")
-        options = ttk.Frame(self.tabs, padding=14)
-        self.tabs.add(options, text="  Дополнительные параметры  ")
+        self.new_tab = ttk.Frame(self.tabs, padding=16)
+        self.result = ResultView(self.tabs, self)
+        self.history = HistoryView(self.tabs, self)
+        self.dicts = DictView(self.tabs, self)
+        options = ttk.Frame(self.tabs, padding=16)
+        for tab, title in ((self.new_tab, "Новая сверка"), (self.result, "Результат"),
+                           (self.history, "История"), (self.dicts, "Справочники"),
+                           (options, "Дополнительные параметры")):
+            self.tabs.add(tab, text=f"  {title}  ")
+        self._build_new(self.new_tab)
         self._build_options(options)
+        self.options_tab = options
 
-        ttk.Label(main, style="Hint.TLabel", text=(
+    def _build_new(self, main):
+        main.columnconfigure(1, weight=1)
+        ttk.Label(main, style="Hint.TLabel", wraplength=900, justify="left", text=(
             "Выберите два Excel-файла с одинаковой структурой. Первый файл считается "
-            "эталоном: отчёт показывает, что с его данными произошло во втором файле."),
-            wraplength=820, justify="left").grid(row=0, column=0, columnspan=3,
-                                                 sticky="w", pady=(0, 10))
+            "эталоном: результат показывает, что с его данными произошло во втором файле."
+        )).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
+        # --- что сверяем ---
+        self.system, self.report = tk.StringVar(value=NO_SYSTEM), tk.StringVar()
+        ttk.Label(main, text="Система:").grid(row=1, column=0, sticky="w", pady=4)
+        what = ttk.Frame(main)
+        what.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=4)
+        self.system_box = ttk.Combobox(what, textvariable=self.system, state="readonly", width=28)
+        self.system_box.pack(side="left")
+        self.system_box.bind("<<ComboboxSelected>>", lambda e: self.fill_reports())
+        ttk.Label(what, text="Отчёт:").pack(side="left", padx=(18, 8))
+        self.report_box = ttk.Combobox(what, textvariable=self.report, state="readonly", width=40)
+        self.report_box.pack(side="left", fill="x", expand=True)
+
+        self.date_from, self.date_to = tk.StringVar(), tk.StringVar()
+        ttk.Label(main, text="Период:").grid(row=2, column=0, sticky="w", pady=4)
+        period = ttk.Frame(main)
+        period.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=4)
+        ttk.Label(period, text="с").pack(side="left")
+        ttk.Entry(period, textvariable=self.date_from, width=12).pack(side="left", padx=(6, 10))
+        ttk.Label(period, text="по").pack(side="left")
+        ttk.Entry(period, textvariable=self.date_to, width=12).pack(side="left", padx=(6, 16))
+        for kind, text in (("month", "Прошлый месяц"), ("quarter", "Прошлый квартал"),
+                           ("year", "С начала года"), ("clear", "Очистить")):
+            ttk.Button(period, text=text, command=lambda k=kind: self.set_period(k)).pack(
+                side="left", padx=(0, 6))
+        ttk.Label(main, style="Hint.TLabel", wraplength=900, justify="left", text=(
+            "Систему, отчёт и период указывать не обязательно. Даты пишутся так: 31.12.2026. "
+            "Если период не указать, он берётся из дат в самих файлах.")).grid(
+                row=3, column=0, columnspan=3, sticky="w", pady=(2, 14))
+
+        # --- файлы ---
         self.file1, self.file2 = tk.StringVar(), tk.StringVar()
         for row, (label, var) in enumerate((("Файл 1 (эталон):", self.file1),
-                                            ("Файл 2:", self.file2)), 1):
-            ttk.Label(main, text=label).grid(row=row, column=0, sticky="w", pady=3)
+                                            ("Файл 2:", self.file2)), 4):
+            ttk.Label(main, text=label).grid(row=row, column=0, sticky="w", pady=4)
             entry = ttk.Entry(main, textvariable=var)
-            entry.grid(row=row, column=1, sticky="ew", padx=8, pady=3)
+            entry.grid(row=row, column=1, sticky="ew", padx=8, pady=4)
             var.trace_add("write", lambda *_, e=entry: e.after_idle(e.xview_moveto, 1))
             ttk.Button(main, text="Выбрать…", command=lambda v=var: self._choose(v)).grid(
-                row=row, column=2, pady=3)
+                row=row, column=2, pady=4)
 
         # --- запуск ---
         run = ttk.Frame(main)
-        run.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(12, 8))
+        run.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(16, 8))
         run.columnconfigure(1, weight=1)
-        self.run_button = ttk.Button(run, text="Сверить", style="Run.TButton",
-                                     command=self.start)
+        self.run_button = ttk.Button(run, text="Сверить", style="Run.TButton", command=self.start)
         self.run_button.grid(row=0, column=0)
         self.progress = ttk.Progressbar(run, mode="indeterminate")
-
-        # --- результат ---
-        self.verdict = tk.Label(main, text="", anchor="w", padx=10, pady=7,
-                                font=("TkDefaultFont", 12, "bold"))
-        self.verdict.grid(row=6, column=0, columnspan=3, sticky="ew")
-        self.summary = ttk.Label(main, text="", style="Hint.TLabel")
-        self.summary.grid(row=7, column=0, columnspan=3, sticky="w", pady=(3, 6))
-
-        log = ttk.Frame(main)
-        log.grid(row=8, column=0, columnspan=3, sticky="nsew")
-        main.rowconfigure(8, weight=1, minsize=90)
-        log.columnconfigure(0, weight=1)
-        log.rowconfigure(0, weight=1)
-        self.log = tk.Text(log, height=10, wrap="none", state="disabled",
-                           font="TkFixedFont", relief="solid", borderwidth=1)
-        self.log.grid(row=0, column=0, sticky="nsew")
-        scroll_y = ttk.Scrollbar(log, orient="vertical", command=self.log.yview)
-        scroll_y.grid(row=0, column=1, sticky="ns")
-        scroll_x = ttk.Scrollbar(log, orient="horizontal", command=self.log.xview)
-        scroll_x.grid(row=1, column=0, sticky="ew")
-        self.log.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
-
-        bottom = ttk.Frame(main)
-        bottom.grid(row=9, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        self.save_button = ttk.Button(bottom, text="Сохранить отчёт…", command=self.save,
-                                      state="disabled")
-        self.save_button.grid(row=0, column=0)
-        self.open_button = ttk.Button(bottom, text="Открыть отчёт", command=self.open_report,
-                                      state="disabled")
-        self.open_button.grid(row=0, column=1, padx=8)
-        self.status = ttk.Label(main, text="", style="Hint.TLabel", wraplength=840,
-                                justify="left")
-        self.status.grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.status = ttk.Label(main, text="", style="Hint.TLabel", wraplength=900, justify="left")
+        self.status.grid(row=7, column=0, columnspan=3, sticky="w")
+        ttk.Label(main, style="Hint.TLabel", wraplength=900, justify="left", text=(
+            "После сверки откроется вкладка «Результат». Каждая сверка сохраняется на вкладке "
+            "«История»: её можно открыть позже и заново сохранить Excel-отчёт. Ваши исходные "
+            "файлы программа не меняет и никуда не копирует.")).grid(
+                row=8, column=0, columnspan=3, sticky="w", pady=(18, 0))
+        self.fill_systems()
 
     def _build_options(self, box):
         """Те же параметры, что у compare_excel.py в командной строке."""
         box.columnconfigure(1, weight=1)
-        ttk.Label(box, style="Hint.TLabel", wraplength=820, justify="left", text=(
+        ttk.Label(box, style="Hint.TLabel", wraplength=900, justify="left", text=(
             "Менять эти параметры не обязательно: пока они не тронуты, сверка идёт "
             "с настройками по умолчанию.")).grid(row=0, column=0, columnspan=3,
                                                 sticky="w", pady=(0, 10))
@@ -211,7 +224,7 @@ class App(tk.Tk):
                  (self.by_order, "Сравнивать строки строго по порядку"),
                  (self.ignore_case, "Не учитывать регистр в тексте"),
                  (self.text_numbers, "Текст, похожий на число, считать числом"),
-                 (self.full, "Добавить в отчёт подробные листы"))
+                 (self.full, "Добавить в Excel-отчёт подробные листы"))
         for k, (var, label) in enumerate(flags):
             ttk.Checkbutton(checks, text=label, variable=var).grid(
                 row=k, column=0, sticky="w", pady=3)
@@ -229,6 +242,60 @@ class App(tk.Tk):
                     self.full):
             var.set(False)
 
+    # ---------- система, отчёт, период ----------
+
+    def fill_systems(self):
+        """Список систем из справочника; первая строка - сверка без справочника."""
+        self.system_ids = {s["name"]: s["id"] for s in self.store.systems()}
+        self.system_box.configure(values=[NO_SYSTEM] + list(self.system_ids))
+        if self.system.get() not in self.system_ids:
+            self.system.set(NO_SYSTEM)
+        self.fill_reports()
+
+    def fill_reports(self):
+        """В списке отчётов - только отчёты выбранной системы."""
+        system_id = self.system_ids.get(self.system.get())
+        rows = self.store.reports(system_id) if system_id else []
+        self.report_ids = {r["name"]: r["id"] for r in rows}
+        self.report_box.configure(values=list(self.report_ids),
+                                  state="readonly" if rows else "disabled")
+        if self.report.get() not in self.report_ids:
+            self.report.set("")
+
+    def dictionaries_changed(self):
+        self.fill_systems()
+        self.history.refresh()
+
+    def set_period(self, kind):
+        if kind == "clear":
+            self.date_from.set("")
+            self.date_to.set("")
+            return
+        first, last = service.quick_period(kind)
+        self.date_from.set(first.strftime("%d.%m.%Y"))
+        self.date_to.set(last.strftime("%d.%m.%Y"))
+
+    def read_period(self):
+        """Период из полей окна: (с, по) или (None, None), если он не указан."""
+        first = service.parse_user_date(self.date_from.get())
+        last = service.parse_user_date(self.date_to.get())
+        if (first is None) != (last is None):
+            raise ValueError("Укажите обе даты периода или оставьте обе пустыми.")
+        if first and first > last:
+            raise ValueError("Дата «с» позже даты «по».")
+        return first, last
+
+    def read_report(self):
+        """Выбранный отчёт справочника или None (сверка без справочника)."""
+        if self.system.get() not in self.system_ids:
+            return None
+        if not self.report_ids:
+            raise ValueError("У этой системы пока нет отчётов. Добавьте их на вкладке "
+                             "«Справочники» или выберите «без справочника».")
+        if self.report.get() not in self.report_ids:
+            raise ValueError("Выберите отчёт.")
+        return self.store.report(self.report_ids[self.report.get()])
+
     def _choose(self, var):
         current = var.get().strip().strip('"')
         folder = str(Path(current).parent) if current else self.last_dir
@@ -237,12 +304,6 @@ class App(tk.Tk):
         if path:
             var.set(path)
             self.last_dir = str(Path(path).parent)
-
-    def _set_log(self, text):
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.insert("1.0", text)
-        self.log.configure(state="disabled")
 
     def _set_busy(self, busy):
         self.run_button.configure(state="disabled" if busy else "normal")
@@ -257,7 +318,6 @@ class App(tk.Tk):
 
     def read_options(self):
         """Собирает Options так же, как это делает main() в compare_excel.py."""
-        eng = self.engine
         try:
             header = int(self.header.get().strip())
         except ValueError:
@@ -268,7 +328,7 @@ class App(tk.Tk):
         if any(names) and not all(names):
             raise ValueError("Названия файлов в отчёте: заполните оба поля или оставьте "
                              "оба пустыми")
-        o = eng.Options(
+        o = ce.Options(
             keys=split_list(self.keys.get()) or None,
             by_order=self.by_order.get(),
             header=header - 1,
@@ -280,7 +340,7 @@ class App(tk.Tk):
             skip_first_column=self.skip_first.get(),
             sheets=split_list(self.sheets.get()) or None,
             full=self.full.get())
-        o.sum_cols = eng.parse_columns(split_list(self.sums.get()))
+        o.sum_cols = ce.parse_columns(split_list(self.sums.get()))
         return o, (list(names) if all(names) else None)
 
     # ---------- сверка ----------
@@ -297,126 +357,93 @@ class App(tk.Tk):
                 return
             paths.append(Path(text))
         try:
+            report = self.read_report()
+            period = self.read_period()
+        except ValueError as e:
+            messagebox.showerror(APP_TITLE, str(e), parent=self)
+            return
+        try:
             o, names = self.read_options()
         except ValueError as e:
-            self.tabs.select(1)
+            self.tabs.select(self.options_tab)
             messagebox.showerror(APP_TITLE, str(e), parent=self)
             return
 
-        self.report = self.saved = None
-        self.save_button.configure(state="disabled")
-        self.open_button.configure(state="disabled")
-        self.verdict.configure(text="", bg=self.cget("bg"))
-        self.summary.configure(text="")
+        saved = json.dumps({"keys": o.keys, "ignore": list(o.ignore), "sheets": o.sheets,
+                            "header": o.header + 1, "tolerance": o.tolerance,
+                            "similarity": o.similarity, "by_order": o.by_order,
+                            "skip_first_column": o.skip_first_column, "full": o.full,
+                            "ignore_case": o.ignore_case, "text_numbers": o.text_numbers,
+                            "sum": self.sums.get().strip(), "names": names}, ensure_ascii=False)
+        run_id = self.store.create_run(report, *paths, *period, saved)
         self.status.configure(text="Идёт сверка…")
-        self._set_log("")
         self._set_busy(True)
-        out_dir = Path(tempfile.mkdtemp(dir=self.tmp))
-        threading.Thread(target=self._work, args=(*paths, o, names, out_dir),
-                         daemon=True).start()
+        threading.Thread(target=self._work, daemon=True, args=(
+            run_id, *paths, report["id"] if report else None, *period, o, names)).start()
 
-    def _work(self, file1, file2, o, names, out_dir):
-        """Фоновый поток: вызывает run_pair из compare_excel.py."""
-        eng = self.engine
-        output = io.StringIO()
+    def _work(self, run_id, file1, file2, report_id, first, last, o, names):
+        """Фоновый поток: сверка с записью результата в историю."""
         try:
-            # Имя отчёта - как у запуска из командной строки без параметра -o
-            nm = eng.derive_names(file1, file2, names)
-            report = out_dir / (f"{nm.prefix}_differences.xlsx" if nm.prefix
-                                else "differences.xlsx")
-            with contextlib.redirect_stdout(output):
-                res, nm, report = eng.run_pair(file1, file2, o, names, report)
-            self.events.put(("done", res, report, output.getvalue()))
-        except PermissionError as e:
-            self.events.put(("error", f"Нет доступа к файлу {e.filename}. Если он открыт "
-                                      "в Excel, закройте его и запустите сверку снова"))
-        except (ValueError, OSError) as e:
-            self.events.put(("error", str(e)))
-        except Exception as e:   # непредвиденная ошибка
-            self.events.put(("error", f"({type(e).__name__}): {e}"))
+            store = Store(self.store.folder)       # у потока своё подключение к базе
+            try:
+                report = store.report(report_id) if report_id else None
+                service.execute(store, run_id, file1, file2, report, first, last, o, names)
+            finally:
+                store.close()
+        except Exception as e:                     # сбой вне самой сверки
+            self.events.put(("crash", run_id, f"({type(e).__name__}): {e}"))
+            return
+        self.events.put(("done", run_id, None))
 
     def _poll(self):
         try:
             while True:
-                event = self.events.get_nowait()
+                kind, run_id, text = self.events.get_nowait()
                 self._set_busy(False)
-                if event[0] == "done":
-                    self._show_result(*event[1:])
-                else:
-                    self.status.configure(text="")
-                    self.verdict.configure(text="  ОШИБКА", bg=RED, fg=RED_TEXT)
-                    self._set_log("Ошибка: " + event[1])
-                    messagebox.showerror(APP_TITLE, "Ошибка: " + event[1], parent=self)
+                self.status.configure(text="")
+                if kind == "crash":
+                    messagebox.showerror(APP_TITLE, "Не удалось записать сверку: " + text,
+                                         parent=self)
+                self.history.refresh()
+                self.dicts.refresh()
+                self.fill_reports()
+                self.show_run(run_id)
         except queue.Empty:
             pass
         self.after(100, self._poll)
 
-    def _show_result(self, res, report, output):
-        self.report = report
-        t = res.totals
-        if res.has_differences:
-            self.verdict.configure(text="  ИТОГ: ЕСТЬ РАЗЛИЧИЯ", bg=RED, fg=RED_TEXT)
+    # ---------- переходы между вкладками ----------
+
+    def show_run(self, run_id):
+        """Открывает сверку на вкладке «Результат»."""
+        self.result.show(run_id)
+        self.tabs.select(self.result)
+
+    def prefill(self, run):
+        """«Сверить заново»: система, отчёт, период и файлы подставляются из сверки."""
+        self.fill_systems()
+        self.system.set(run["system"] if run["system"] in self.system_ids else NO_SYSTEM)
+        self.fill_reports()
+        if run["report"] in self.report_ids:
+            self.report.set(run["report"])
+        if run["period_from"] and not run["period_auto"]:
+            self.date_from.set(service.format_day(run["period_from"]))
+            self.date_to.set(service.format_day(run["period_to"]))
         else:
-            self.verdict.configure(text="  ИТОГ: ФАЙЛЫ СОВПАДАЮТ", bg=GREEN, fg=GREEN_TEXT)
-        self.summary.configure(text=(
-            f"Строк в файлах: {t['rows_a']} / {t['rows_b']}   ·   совпали полностью: "
-            f"{t['exact']}   ·   с расхождениями: {t['changed']}   ·   только в одном "
-            f"из файлов: {t['only_a'] + t['only_b']}"))
-        # Тот же текст, что скрипт печатает в консоль (без пути во временной папке
-        # и без совета поставить python-calamine: приложению она не нужна)
-        lines = [s for s in output.strip("\n").split("\n")
-                 if not s.startswith(("Отчёт: ", "  Чтение файлов можно ускорить"))]
-        self._set_log("\n".join(lines))
-        self.save_button.configure(state="normal")
-        self.open_button.configure(state="normal")
-        self.status.configure(text=f"Отчёт готов: {report.name}. Сохраните его кнопкой слева.")
+            self.set_period("clear")
+        self.file1.set(run["file_a"] or "")
+        self.file2.set(run["file_b"] or "")
+        self.tabs.select(self.new_tab)
 
-    # ---------- отчёт ----------
-
-    def save(self):
-        if not self.report:
-            return
-        path = filedialog.asksaveasfilename(
-            parent=self, title="Сохранить отчёт", initialdir=self.last_dir,
-            initialfile=self.report.name, defaultextension=".xlsx",
-            filetypes=[("Файлы Excel", "*.xlsx")])
-        if not path:
-            return
-        try:
-            shutil.copyfile(self.report, path)
-        except PermissionError:
-            messagebox.showerror(APP_TITLE, f"Нет доступа к файлу {path}. Если он открыт "
-                                 "в Excel, закройте его и сохраните отчёт снова", parent=self)
-            return
-        except OSError as e:
-            messagebox.showerror(APP_TITLE, f"Не удалось сохранить отчёт: {e}", parent=self)
-            return
-        self.saved = Path(path)
-        self.last_dir = str(self.saved.parent)
-        self.status.configure(text=f"Отчёт сохранён: {self.saved}")
-
-    def open_report(self):
-        target = self.saved or self.report
-        if not target:
-            return
-        try:
-            open_file(target)
-        except OSError as e:
-            messagebox.showerror(APP_TITLE, f"Не удалось открыть отчёт: {e}", parent=self)
+    def close(self):
+        self.store.close()
+        self.destroy()
 
     def report_callback_exception(self, exc, val, tb):
         """Ошибка в самом окне: показываем, а не теряем (консоли может не быть)."""
         text = "".join(traceback.format_exception(exc, val, tb))
         messagebox.showerror(APP_TITLE, "Непредвиденная ошибка:\n\n" + text[-1500:],
                              parent=self)
-
-
-def load_engine():
-    """Модуль сверки compare_excel.py; в роли pandas ему подставляется pandas_lite."""
-    import pandas_lite
-    sys.modules["pandas"] = pandas_lite
-    import compare_excel
-    return compare_excel
 
 
 def main():
@@ -426,15 +453,21 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
-    try:
-        engine = load_engine()
-    except ImportError as e:
+    problem = None
+    if IMPORT_ERROR is not None:
+        problem = (f"Не удалось загрузить программу: {IMPORT_ERROR}\n\n"
+                   "Запустите установку (install) ещё раз.")
+    else:
+        try:
+            store = Store()
+        except Exception as e:
+            problem = f"Не удалось открыть папку с данными программы: {e}"
+    if problem:
         root = tk.Tk()
         root.withdraw()
-        messagebox.showerror(APP_TITLE, f"Не удалось загрузить модуль сверки: {e}\n\n"
-                             "Запустите установку (install) ещё раз.")
+        messagebox.showerror(APP_TITLE, problem)
         return 2
-    App(engine).mainloop()
+    App(store).mainloop()
     return 0
 
 

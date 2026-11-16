@@ -311,6 +311,10 @@ XLS_SIGNATURES = (b"\x09\x00\x04\x00\x07\x00\x10\x00", b"\x09\x02\x06\x00\x00\x0
                   b"\x09\x04\x06\x00\x00\x00\x10\x00", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
 
 
+NOT_EXCEL = ("Это не файл Excel или он повреждён. Нужен файл в формате .xlsx: откройте его "
+             "в Excel и сохраните через «Файл → Сохранить как → Книга Excel».")
+
+
 def _check_format(handle):
     """Определяет формат файла по содержимому, как pandas; читаем только xlsx/xlsm."""
     handle.seek(0)
@@ -320,8 +324,7 @@ def _check_format(handle):
         raise ValueError("Файл в старом формате .xls. Откройте его в Excel и сохраните "
                          "как .xlsx")
     if not peek.startswith(b"PK\x03\x04"):
-        raise ValueError("Excel file format cannot be determined, you must specify "
-                         "an engine manually.")
+        raise ValueError(NOT_EXCEL)
     with zipfile.ZipFile(handle) as archive:
         names = [name.replace("\\", "/").lower() for name in archive.namelist()]
     handle.seek(0)
@@ -331,8 +334,7 @@ def _check_format(handle):
         raise ValueError("Файл в формате .xlsb. Откройте его в Excel и сохраните как .xlsx")
     if "content.xml" in names:
         raise ValueError("Файл в формате .ods. Откройте его в Excel и сохраните как .xlsx")
-    raise ValueError("Excel file format cannot be determined, you must specify "
-                     "an engine manually.")
+    raise ValueError(NOT_EXCEL)
 
 
 def _sheet_rows(sheet):
