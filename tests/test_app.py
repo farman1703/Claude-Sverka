@@ -265,6 +265,30 @@ class Case(unittest.TestCase):
         self.assertEqual((run["side_a"], run["in_b"], service.run_title(run)),
                          ("Файл 1", "файле 2", "Сверка двух файлов"))
 
+    def test_timestamp_column_is_technical(self):
+        """Одна отметка времени на весь файл - техническое отличие, на итог не влияет."""
+        head = [*HEAD, "Сформировано"]
+        run, status = self.compare([[*r, "13.11.2026 10:00:00"] for r in BASE],
+                                   [[*r, "13.11.2026 10:07:30"] for r in BASE], head=head)
+        summary = json.loads(run["summary"])
+        self.assertEqual((status, run["structure"], summary["whole"]), ("ok", 0, []))
+        self.assertEqual([t[2:] for t in summary["tech"]],
+                         [["13.11.2026 10:00:00", "13.11.2026 10:07:30"]])
+
+    def test_column_differing_everywhere_is_a_difference(self):
+        """Одно другое значение на весь столбец (не время) - расхождение во всём файле."""
+        head = [*HEAD, "Валюта"]
+        run, status = self.compare([[*r, "USD"] for r in BASE], [[*r, "EUR"] for r in BASE],
+                                   head=head)
+        summary = json.loads(run["summary"])
+        self.assertEqual((status, run["structure"], run["changed"], summary["tech"]),
+                         ("diff", 1, 0, []))
+        self.assertEqual([w[2:] for w in summary["whole"]], [["USD", "EUR"]])
+        self.assertEqual(service.run_label(run), ("bad", "расхождения"))
+        # служебный столбец можно исключить - тогда данные совпадают
+        self.assertEqual(self.compare([[*r, "USD"] for r in BASE], [[*r, "EUR"] for r in BASE],
+                                      head=head, ignore=("Валюта",))[1], "ok")
+
     def test_broken_file_is_saved_as_error(self):
         good, bad = self.xlsx(BASE), self.folder / "broken.xlsx"
         bad.write_text("это не Excel", encoding="utf-8")

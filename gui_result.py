@@ -133,6 +133,11 @@ class ResultView(tk.Frame):
             items += [(f"Столбец {col}", f"Во всех строках: «{v1}» в {run['in_a']}, «{v2}» в "
                        f"{run['in_b']}") for _, col, v1, v2 in whole]
             self.pairs_table(items, BAD_BG)
+            if whole:
+                self.label(self.page_box, "Столбец, который во всём файле отличается одним "
+                           "значением, считается расхождением. Если он служебный, исключите его: "
+                           "«Дополнительные параметры» → «Не сравнивать столбцы».",
+                           "small", MUTED).pack(fill="x", pady=(4, 0))
 
         self.rows_box = tk.Frame(self.page_box, bg=BG)
         self.rows_box.pack(fill="x")
@@ -141,9 +146,9 @@ class ResultView(tk.Frame):
         tech = self.summary.get("tech") or []
         if tech:
             self.heading("Не учтено в итоге")
-            self.pairs_table([(f"Столбец {col}", f"Одно значение на весь файл, разное в двух "
-                               f"файлах: «{v1}» и «{v2}». Расхождением данных не считается")
-                              for _, col, v1, v2 in tech], CARD)
+            self.pairs_table([(f"Столбец {col}", f"Отметка времени, одна на весь файл: «{v1}» "
+                               f"и «{v2}». Похоже на время формирования отчёта, расхождением "
+                               "данных не считается") for _, col, v1, v2 in tech], CARD)
         if self.summary.get("checks"):
             self.checks_button = ttk.Button(self.page_box, command=self.toggle_checks)
             self.checks_button.pack(anchor="w", pady=(16, 4))

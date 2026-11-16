@@ -25,13 +25,14 @@
     Нет в файле 1, есть в файле 2    данные лишние
     Значения разные                  заполнено в обоих файлах, но по-разному
 
-Отчёт (по умолчанию <общая часть имени>_differences.xlsx) - один лист «Итог»:
+Отчёт (по умолчанию <общая часть имени>_differences.xlsx рядом с первым
+файлом) - один лист «Итог»:
     - вывод: совпадают данные или нет, сколько строк и ячеек расходится;
     - таблица расхождений: для каждой отличающейся записи две строки (из первого
       и из второго файла) со всеми столбцами, отличающиеся ячейки подсвечены;
     - строки, которые есть только в одном из файлов;
-    - технические отличия (столбец с одним значением на весь файл, например
-      время формирования отчёта): показаны отдельно и на итог не влияют;
+    - технические отличия (столбец с одной отметкой времени на весь файл,
+      например время формирования отчёта): показаны отдельно и на итог не влияют;
     - замечания, проверки без замечаний и справочная информация.
 С параметром --full добавляются подробные листы: «Все проверки», «Описание
 различий», «Различия по ячейкам», «Столбцы». Они же добавляются сами, если
@@ -62,10 +63,14 @@
     - текст «NA», «NULL», «None» и подобный - это текст, а не пустая ячейка.
 
 Если столбец в каждом файле заполнен одним значением, а между файлами эти
-значения разные (например, время формирования отчёта), он отмечается одной
-записью и не мешает сопоставлению остальных данных.
+значения разные, он отмечается одной записью и не мешает сопоставлению
+остальных данных. Техническим отличием (на итог не влияет) считается только
+отметка времени - дата со временем или время, например время формирования
+отчёта. Любое другое значение (валюта, год, дата без времени) - расхождение;
+служебный столбец можно исключить параметром --ignore.
 
-Код возврата: 0 - различий нет, 1 - различия есть, 2 - ошибка.
+Код возврата: 0 - различий нет, 1 - различия есть, 2 - ошибка (в режиме --dir -
+если не удалось сравнить хотя бы одну пару).
 
 Зависимости: pip install pandas openpyxl
 Для быстрого чтения больших файлов (в несколько раз быстрее):
@@ -99,6 +104,10 @@ TOO_COMMON = 100               # значения, встречающиеся ч
 NUMBER_RE = re.compile(r"[+-]?\d+([.,]\d+)?")
 QUOTES_RE = re.compile("[\"'«»“”„‘’`]")
 BATCH_SUMMARY = "summary_all_reports.xlsx"
+# Дата со временем или время: так выглядит отметка о формировании отчёта
+STAMP_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}|\d{2}[./]\d{2}[./]\d{4})[ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?"
+    r"(Z|[+-]\d{2}:?\d{2})?|\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?")
 
 
 @dataclass
@@ -142,6 +151,15 @@ def is_empty(v):
 
 def is_number(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def is_stamp(v):
+    """Отметка времени: дата со временем или время (в ячейке или текстом)."""
+    if isinstance(v, datetime):
+        return bool(v.hour or v.minute or v.second or v.microsecond)
+    if isinstance(v, time):
+        return True
+    return isinstance(v, str) and bool(STAMP_RE.fullmatch(v.strip()))
 
 
 def canon(v, o):
@@ -382,6 +400,8 @@ class Result:
     sum_used: set = field(default_factory=set)        # какие столбцы --sum нашлись
     tables: list = field(default_factory=list)        # таблицы расхождений для «Итога»
     tech: list = field(default_factory=list)          # технические отличия
+    whole: list = field(default_factory=list)         # столбцы, разные во всех строках
+    books: tuple = ()                                 # прочитанные файлы (для сайта)
 
     @property
     def has_differences(self):
@@ -687,6 +707,10 @@ def compare_sheet(res, sheet, df1, df2, o, nm, sheet_ids=None):
                 v1, v2 = raw1[c][fr1[0]], raw2[c][fr2[0]]
                 if not values_equal(v1, v2, o):
                     const[c] = (v1, v2)
+    # Техническим считаем только отметку времени (дата со временем или время):
+    # так выглядит время формирования отчёта. Остальное - расхождение данных
+    tech_cols = [c for c, (v1, v2) in const.items() if is_stamp(v1) and is_stamp(v2)]
+    whole_cols = [c for c in const if c not in tech_cols]
     for c, (v1, v2) in const.items():
         res.describe(sheet, "Столбец целиком", f"Столбец {display(c)}, все строки",
                      f"В {A_in} везде «{brief(v1, 60)}», в {B_in} везде «{brief(v2, 60)}»")
@@ -694,9 +718,19 @@ def compare_sheet(res, sheet, df1, df2, o, nm, sheet_ids=None):
                    val_a=v1, val_b=v2,
                    reason="отличается во всех строках")
         res.totals["const_columns"] += 1
-        res.tech.append((sheet, cell_col(c), v1, v2))
+        if c in tech_cols:
+            res.tech.append((sheet, cell_col(c), v1, v2))
+        else:
+            res.whole.append((sheet, cell_col(c), v1, v2))
+            res.totals["const_real"] += 1
     res.check(sheet, "Столбцы, отличающиеся во всех строках",
-              TECH if const else OK, comment=listing(map(display, const)))
+              DIFF if whole_cols else OK, comment=
+              listing(map(display, whole_cols)) + ". Одно значение на весь файл, разное "
+              "в двух файлах; служебный столбец можно исключить: --ignore"
+              if whole_cols else "")
+    if tech_cols:
+        res.check(sheet, "Технические столбцы", TECH, comment=
+                  listing(map(display, tech_cols)) + ". Отметка времени, одна на весь файл")
 
     cmp_cols = [c for c in common if c not in const]
     rows1 = list(zip(*[raw1[c] for c in cmp_cols])) if cmp_cols else [()] * n1
@@ -868,10 +902,10 @@ def compare_sheet(res, sheet, df1, df2, o, nm, sheet_ids=None):
         total1, total2 = len(active1), len(active2)
 
     # --- отличия в сопоставленных строках ---
-    const_cols = list(const)
+    const_cols = whole_cols + tech_cols
     table = {"sheet": sheet, "pairs": [], "only": [],
              "columns": [cell_col(c) for c in cmp_cols + const_cols],
-             "tech": len(const_cols)}
+             "tech": len(tech_cols), "whole": len(whole_cols)}
     changed = 0
     reasons = Counter()
     col_stats = defaultdict(Counter)
@@ -1095,7 +1129,7 @@ def read_book(path, header):
             FAST_READER = False
             raise RereadNeeded
     return pd.read_excel(path, sheet_name=None, header=header, dtype=object,
-                         **READ_OPTIONS)
+                         engine="openpyxl", **READ_OPTIONS)
 
 
 class RereadNeeded(Exception):
@@ -1110,6 +1144,7 @@ def compare_files(path1, path2, o, nm):
         book1 = read_book(path1, o.header)
         book2 = read_book(path2, o.header)
     res = Result()
+    res.books = (book1, book2)
 
     # Если в каждом файле один лист, сравниваем их даже при разных названиях
     if len(book1) == 1 and len(book2) == 1 and list(book1) != list(book2) and not o.sheets:
@@ -1299,7 +1334,10 @@ def build_summary_sheet(ws, res, file1, file2, nm, extra_tabs):
             parts.append(f"строк только в одном файле: {only_total}")
         if t["structure"]:
             parts.append(f"отличий в структуре: {t['structure']}")
-        parts.append(f"совпадение {round(share * 100, 3):g}%")
+        if t["const_real"]:
+            parts.append(f"столбцов отличается во всех строках: {t['const_real']}")
+        else:
+            parts.append(f"совпадение {round(share * 100, 3):g}%")
         verdict, fill, color = "   ·   ".join(parts), "FFC7CE", "9C0006"
     else:
         verdict, fill, color = "ИТОГ: ДАННЫЕ СОВПАДАЮТ", "C6EFCE", "006100"
@@ -1353,12 +1391,14 @@ def build_summary_sheet(ws, res, file1, file2, nm, extra_tabs):
     for table in res.tables:
         if not table["pairs"] and not table["only"]:
             continue
-        columns, ntech = table["columns"], table["tech"]
+        columns, ntech, nwhole = table["columns"], table["tech"], table["whole"]
         ncol = len(columns)
         first_tech = ncol - ntech
+        first_whole = first_tech - nwhole
         col_n, col_hint = 3 + ncol, 4 + ncol
         labels = (["Система", "№ строки\nв файле"]
-                  + [c + ("\n(технический, исключён)" if k >= first_tech else "")
+                  + [c + ("\n(технический, исключён)" if k >= first_tech else
+                          "\n(отличается во всех строках)" if k >= first_whole else "")
                      for k, c in enumerate(columns)] + ["Отличий,\nячеек", "Что проверить"])
         for k, c in enumerate(columns):
             widths[3 + k] = max(widths.get(3 + k, 0), min(len(c), 28))
@@ -1376,8 +1416,9 @@ def build_summary_sheet(ws, res, file1, file2, nm, extra_tabs):
                     put(ws, r, 1, system, bold=True, fill="EDEDED", heavy=heavy)
                     put(ws, r, 2, number, fmt=ROW_FORMAT, heavy=heavy)
                     for k, value in enumerate(values):
-                        data_cell(r, 3 + k, value, kinds.get(k), k >= first_tech, heavy)
-                put(ws, row, col_n, len(kinds), bold=True, align="center", valign="center",
+                        kind = kinds.get(k, "value" if first_whole <= k < first_tech else None)
+                        data_cell(r, 3 + k, value, kind, k >= first_tech, heavy)
+                put(ws, row, col_n, len(kinds) + nwhole, bold=True, align="center", valign="center",
                     wrap=False)
                 put(ws, row + 1, col_n, None, heavy=True)
                 ws.merge_cells(start_row=row, start_column=col_n, end_row=row + 1,
@@ -1472,6 +1513,23 @@ def build_summary_sheet(ws, res, file1, file2, nm, extra_tabs):
             row += 1
         row += 1
 
+    # --- столбцы, отличающиеся во всех строках ---
+    if res.whole:
+        title(row, "Столбцы, отличающиеся во всех строках — расхождение "
+                   "(в подсчёт строк и ячеек выше не входят)")
+        header(row + 1, ["Столбец", A, B, "Комментарий"], merge_last_to=span)
+        row += 2
+        for sheet, label, v1, v2 in res.whole:
+            put(ws, row, 1, label + (f" (лист «{sheet}»)" if many_sheets else ""))
+            put(ws, row, 2, v1, fill="FFC7CE")
+            put(ws, row, 3, v2, fill="FFC7CE")
+            put(ws, row, 4, "Одно значение на весь файл, разное в двух файлах. Если столбец "
+                "служебный, его можно исключить из сверки: --ignore")
+            wide(ws, row, 4, span)
+            ws.row_dimensions[row].height = 27
+            row += 1
+        row += 1
+
     # --- технические отличия ---
     if res.tech:
         title(row, "Исключено из сверки — технические отличия (на итог не влияют)")
@@ -1488,7 +1546,8 @@ def build_summary_sheet(ws, res, file1, file2, nm, extra_tabs):
         row += 1
 
     # --- проверки ---
-    shown_elsewhere = {"Столбцы, отличающиеся во всех строках", "Строки, совпавшие полностью",
+    shown_elsewhere = {"Столбцы, отличающиеся во всех строках", "Технические столбцы",
+                       "Строки, совпавшие полностью",
                        "Строки с отличиями в ячейках", "Отличия в ячейках по причинам",
                        "Суммы по указанным столбцам", "Значения разные",
                        f"Есть в {nm.a_in}, нет в {nm.b_in}", f"Нет в {nm.a_in}, есть в {nm.b_in}"}
@@ -1839,8 +1898,9 @@ def print_result(res, file1, file2, report):
 def run_pair(file1, file2, o, names, report):
     nm = derive_names(file1, file2, names)
     res = compare_files(file1, file2, o, nm)
-    if report is None:
-        report = Path(f"{nm.prefix}_differences.xlsx" if nm.prefix else "differences.xlsx")
+    if report is None:   # по умолчанию отчёт кладём рядом с первым файлом
+        report = Path(file1).parent / (f"{nm.prefix}_differences.xlsx" if nm.prefix
+                                       else "differences.xlsx")
     elif report.is_dir():
         report = report / (f"{nm.prefix}_differences.xlsx" if nm.prefix
                            else f"{Path(file1).stem}_differences.xlsx")
@@ -1901,6 +1961,14 @@ def main():
                    help="какая доля ячеек должна совпасть, чтобы две строки считались "
                         "одной строкой с изменениями (от 0 до 1, по умолчанию 0.5)")
     args = p.parse_args()
+    if not 0 <= args.similarity <= 1:
+        p.error("--similarity должен быть от 0 до 1")
+    if args.tolerance < 0:
+        p.error("--tolerance не может быть отрицательным")
+    if args.header < 1:
+        p.error("--header: номер строки заголовков считается с 1")
+    if args.key and args.by_order:
+        p.error("укажите что-то одно: --key или --by-order")
 
     o = Options(keys=args.key, by_order=args.by_order, header=args.header - 1,
                 tolerance=args.tolerance, ignore_case=args.ignore_case,
@@ -1923,7 +1991,7 @@ def main():
             if not out.is_dir():
                 raise ValueError(f"Для --dir параметр -o должен быть папкой: {out}")
             pairs, unpaired, notes = find_pairs(args.dir, args.systems)
-            summary, any_diff = [], False
+            summary, any_diff, any_error = [], False, False
             for f1, f2 in pairs:
                 row = {"Файл 1": f1.name, "Файл 2": f2.name}
                 try:
@@ -1939,7 +2007,7 @@ def main():
                            "Отличий в структуре": t["structure"],
                            "Файл с подробностями": report.name}
                 except Exception as e:
-                    any_diff = True
+                    any_error = True
                     row["Итог"] = f"ошибка: {e}"
                     print(f"\n{f1.name}\n{f2.name}\n  Ошибка: {e}")
                 summary.append(row)
@@ -1954,6 +2022,9 @@ def main():
                 print("  Внимание: " + n)
             for f in unpaired:
                 print(f"  Пара не найдена: {f.name}")
+            if any_error:
+                print("  Часть пар сравнить не удалось, см. ошибки выше", file=sys.stderr)
+                return 2
             return 1 if any_diff else 0
 
         if not (args.file1 and args.file2):
